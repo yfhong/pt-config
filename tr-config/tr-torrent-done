@@ -1,0 +1,245 @@
+#!/bin/sh -e
+#
+# Copyright (C) 2021 Hong Yifan <hyfing@gmail.com>
+#
+# Derived from transmission_torrent_done.sh by Deokgyu Yang <secugyu@gmail.com>
+#
+# This is free software, licensed under the GNU General Public License v3.
+# See /LICENSE for more information.
+#
+# 2021. 01. 26 Initial version
+# 2017. 09. 25 Updated
+# 2018. 01. 17 Updated
+#   Split log file when the file size is bigger than 100 KB
+#   Remove unimportant comments
+#   Clean up the descriptions
+#   Clean up the codes
+#   Add datetime for each log
+#   Add a guide for applying this script
+# 2018. 10. 08 Updated
+#   Add double quotes to prevent splitting words
+#
+# Check before use this script:
+# A. Add debian-transmission into sudores file to grant sudo permission without password.
+#   - Follow a guide below.
+#   1. $ sudo visudo
+#   2. $ sudo usermod -a -G sudo debian-transmission
+#   3. Paste it at the end of the file: debian-transmission ALL=(ALL:ALL) NOPASSWD:ALL
+#   4. Save and quit.
+# B. Change written paths to yours.
+# C. Make sure that debian-transmission has proper permission for working directories.
+# D. Make sure that giving "execute" permission to this script and debian-transmission can execute this.
+# E. Enable using "done script" and type absolute path of this script, and restart transmission-daemon service.
+#
+# Plz feel free to give any suggestions and feedbacks.
+#   - http://awesometic.tistory.com
+#   - https://gist.github.com/awesometic/253b740d45f8e5f95b56ec24f33a9444
+# Enjoy.
+
+__errmsg() {
+	echo "tr-torrent-done: $*" >&2
+}
+
+tr_torrent_done_usage() {
+	cat >&2 <<EOF
+Usage: tr-torrent-done [options]
+
+    -h, --help      Show this help message then exit
+	-u <rpc_username>, --user <rpc_username>
+                    Set the username for rpc authentication
+                    Or set the RPCUSERNAME environment variable alternative
+	-x <rpc_password>, --password <rpc_password>
+                    Set the password for authentication
+                    Or set the RPCPASSWORD environment variable alternative
+	-s <ip>, --server <ip>
+                    IP address of transmission daemon. Default to localhost
+	-p <port>, --port <port>
+                    Port to send transmission rpc requests. Default to 9091
+	-m <directory_moved_to>, --move <directory_moved_to>
+                    Set the target directory current torrents' data moved to
+
+    ONLY for moving torrents manually.
+	-t <torrent_id>, --torrent <torrent_id>
+                    Set the current torrent(s) used by subsequent options
+	-d <directory>, --download-dir <directory>
+                    The torrent's download folder
+	-n <torrent_name>, --torrent-name <torrent_name>
+                    The torrent's name
+
+
+The following environment variables will be inherited from Transmission deamon.
+
+    TR_APP_VERSION
+    TR_TIME_LOCALTIME
+    TR_TORRENT_DIR
+    TR_TORRENT_HASH
+    TR_TORRENT_ID
+    TR_TORRENT_NAME
+
+EOF
+###############################################################################
+# These are inherited from Transmission.                                      #
+# Do not declare these. Just use as needed.                                   #
+#                                                                             #
+# TR_APP_VERSION                                                              #
+# TR_TIME_LOCALTIME                                                           #
+# TR_TORRENT_DIR                                                              #
+# TR_TORRENT_HASH                                                             #
+# TR_TORRENT_ID                                                               #
+# TR_TORRENT_NAME                                                             #
+#                                                                             #
+###############################################################################
+}
+
+
+# User define constants
+OWNER_UID="transmission"
+OWNER_GID="nobody"
+
+LOG_DIR="$HOME/logs"
+LOG_FILE_NAME="auto_move.log"
+
+TR_PT_ARCHIVED_DIR_BASE="/tank/nfsroot/pt"
+TR_PT_DL_DIR_BASE="/tank/nfsroot/pt/_downloading"
+
+## Variables
+o_tr_rpc_username=${RPCUSERNAME}
+o_tr_rpc_password=${RPCPASSWORD}
+
+o_tr_rpc_server="127.0.0.1"
+o_tr_rpc_port="9091"
+
+o_tr_torrent_directory=${TR_TORRENT_DIR}
+o_tr_torrent_name=${TR_TORRENT_NAME}
+o_tr_torrent_id=${TR_TORRENT_ID}
+
+tr_torrent_done_parse_args() {
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-h|--help) tr_torrent_done_usage; exit 0;;
+			-u|--user) o_tr_rpc_username="$2"; shift 2;;
+            -x|--password) o_tr_rpc_password="$2"; shift 2;;
+            -s|--server) o_tr_rpc_server="$2"; shift 2;;
+            -p|--port) o_tr_rpc_port="$2"; shift 2;;
+            -m|--move) o_tr_move_to_directory="$2"; shift 2;;
+            -t|--torrent) o_tr_torrent_id="$2"; shift 2;;
+            -d|--download-dir) o_tr_torrent_directory="$2"; shift 2;;
+            -n|--torrent-name) o_tr_torrent_name="$2"; shift 2;;
+			*) __errmsg "unknown option $1"; tr_torrent_done_usage; return 1;;
+		esac
+	done
+
+	if [ -z "$o_tr_rpc_username" ]; then
+		__errmsg "Requires username for rpc authentication."
+		return 1
+	fi
+	if [ -z "$o_tr_rpc_password" ]; then
+		__errmsg "Requires password for rpc authentication."
+		return 1
+	fi
+
+    if ! ( expr "$o_tr_rpc_server" : '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' > /dev/null ) ; then
+	    o_tr_rpc_server="$(host $o_tr_rpc_server | sed -ne '/:/! p' | cut -d' ' -f4)"
+    fi
+}
+
+__size_of_file() {
+    case "$(uname)" in
+        FreeBSD) return "$(stat -f%z $1)" ;;
+        Linux) return "$(stat -c%s $1)" ;;
+        *) return -1;;
+    esac
+}
+
+__log_rotate() {
+    local _logfile="$LOG_DIR"/"$LOG_FILE_NAME"
+    local _log_file_count
+
+    ## logrotate
+    if [ -f "$_logfile" ] && [ "$(__size_of_file $_logfile)" -gt 100000 ]; then
+        _log_file_count=\
+            $(find "$LOG_DIR" -maxdepth 1 -name "$LOG_FILE_NAME*" | wc -l)
+        mv "$_logfile" "$_logfile"."$_log_file_count"
+    fi
+
+    ## create logfile
+    if ! [ -f "$_logfile" ]; then
+        touch "$_logfile"
+        chmod 664 "$_logfi_logfilele_temp"
+    fi
+}
+
+__log() {
+    local _log_msg=$1
+    local _logfile=${2:-"$LOG_DIR/$LOG_FILE_NAME"}
+    local _main_logfile="$LOG_DIR/$LOG_FILE_NAME"
+
+    ## create logfile
+    if ! [ -f "$_logfile" ]; then
+        touch "$_logfile"
+        chmod 664 "$_logfile"
+    fi
+
+    ## log it
+    local _timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$_timestamp] $_log_msg" >> "$_logfile"
+
+    if [ ${_log_msg#"Finish"} != $_log_msg -a $_logfile != $_main_logfile ]; then
+        cat "$_logfile" >> "$_main_logfile"
+        rm $_logfile
+    fi
+}
+
+tr_torrent_done_move() {
+    __log_rotate
+
+    local _temp_log_file="/tmp/$o_tr_torrent_id.tr_moving"
+
+    ## start moving
+    __log "Begin: $o_tr_torrent_id:$o_tr_torrent_name" "$_temp_log_file"
+
+    ## Create subdirectory to classify torrents by pt site name and
+    ## torrent type.
+    local _parent_dir=${o_tr_torrent_directory#$TR_PT_DL_DIR_BASE/}
+    local _move_dir
+    if [ $_parent_dir != $o_tr_torrent_directory ]; then
+        _move_dir="$TR_PT_ARCHIVED_DIR_BASE/$_parent_dir"
+    else
+        _move_dir="$TR_PT_ARCHIVED_DIR_BASE/__unclassified"
+    fi
+
+    if ! [ -d "$_move_dir" ]; then
+        __log "Create a new directory: $_move_dir" "$_temp_log_file"
+        mkdir -p "$_move_dir"
+        chown $OWNER_UID:$OWNER_GID "$_move_dir"
+    fi
+
+    ## move to archived directory.
+    __log "Moving torrent $o_tr_torrent_name to $_move_dir" "$_temp_log_file"
+    transmission-remote "$o_tr_rpc_server:$o_tr_rpc_port" \
+        --auth "$o_tr_rpc_username:$o_tr_rpc_password" \
+        --torrent "$o_tr_torrent_id" \
+        --move "$_move_dir"
+
+    __log "Finish: $o_tr_torrent_id:$o_tr_torrent_name" "$_temp_log_file"
+}
+
+main() {
+    if [ $# -eq 0 ]; then
+        echo "usage: $0 start|stop|restart ..."
+        return 1
+    fi
+
+    for funcname in "$@"; do
+        if [ "$(type -t $funcname)" != 'function' ]; then
+            echo "'$funcname' not a shell function"
+            return 1
+        fi
+    done
+
+    for funcname in "$@"; do
+        $funcname
+    done
+    return 0
+}
+main "$@"
